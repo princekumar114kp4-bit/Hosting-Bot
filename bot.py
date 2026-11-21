@@ -326,6 +326,11 @@ if not cmd:
     _fail("no command to run")
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
+try:                                                # if memory runs out, the kernel stops a hosted script first, not the hosting bot
+    with open("/proc/self/oom_score_adj", "w") as _oom:
+        _oom.write("500")
+except OSError:
+    pass
 
 # Landlock access bits (kernel ABI 1 = bits 0-12, ABI 2 adds REFER, ABI 3 adds TRUNCATE)
 EXEC, WRITE_FILE, READ_FILE, READ_DIR = 1, 2, 4, 8
@@ -368,39 +373,75 @@ def _landlock(ro_paths, rw_paths):
                 os.close(fd)
     return rs_fd, abi
 
-def _seccomp(deny_truncate):
+def _seccomp(deny_truncate, protect=()):
     arch = platform.machine()
     if arch == "x86_64":
         audit, nrs, x32 = 0xC000003E, [101, 310, 311], True
         trunc = 76
+        kill_nr, sig_all, sig_pid = 62, [424], [200, 234, 129, 297, 434]
     elif arch in ("aarch64", "arm64"):
         audit, nrs, x32 = 0xC00000B7, [117, 270, 271], False
         trunc = 45
+        kill_nr, sig_all, sig_pid = 129, [424], [130, 131, 138, 240, 434]
     else:
         return False
     if deny_truncate:
         nrs.append(trunc)
-    ins = [(0x20, 0, 0, 4), (0x15, 0, 0, audit), (0x20, 0, 0, 0)]
+    nrs = nrs + sig_all                              # pidfd_send_signal: no way to tell whom it hits
+    # A script must never be able to signal the hosting bot, its parent, its process group or "everybody" (kill -1):
+    # kill / tkill / tgkill / rt_sigqueueinfo / rt_tgsigqueueinfo / pidfd_open on those numbers fail with EPERM.
+    # (kill with signal 0, the "does this process exist" check, stays allowed.)
+    values = {0xFFFFFFFF}
+    for pid in protect:
+        values.add(int(pid) & 0xFFFFFFFF)
+        values.add((-int(pid)) & 0xFFFFFFFF)
+    values = sorted(values)
+    prog, labels = [], {}
+    def emit(code, jt, jf, k):
+        prog.append([code, jt, jf, k])
+    emit(0x20, 0, 0, 4)                              # load the architecture
+    emit(0x15, 0, "allow0", audit)                   # another architecture: leave it alone
+    emit(0x20, 0, 0, 0)                              # load the system call number
     if x32:
-        ins.append((0x35, 0, 0, 0x40000000))
+        emit(0x35, "deny0", 0, 0x40000000)
     for nr in nrs:
-        ins.append((0x15, 0, 0, nr))
-    ins.append((0x06, 0, 0, 0x7FFF0000))          # allow
-    ins.append((0x06, 0, 0, 0x00050001))          # deny with EPERM
-    allow_at, deny_at = len(ins) - 2, len(ins) - 1
+        emit(0x15, "deny0", 0, nr)
+    emit(0x05, 0, 0, 2)                              # nothing matched yet: skip the two answers below
+    labels["deny0"] = len(prog)
+    emit(0x06, 0, 0, 0x00050001)                     # EPERM
+    labels["allow0"] = len(prog)
+    emit(0x06, 0, 0, 0x7FFF0000)                     # allow
+    for nr in [kill_nr] + sig_pid:
+        skip, bad = "skip%d" % nr, "bad%d" % nr
+        emit(0x15, 0, skip, nr)
+        emit(0x20, 0, 0, 16)                         # first argument (the pid), low 32 bits
+        for value in values:
+            emit(0x15, "chk" if nr == kill_nr else bad, 0, value)
+        emit(0x06, 0, 0, 0x7FFF0000)                 # any other pid: allow
+        if nr == kill_nr:
+            labels["chk"] = len(prog)
+            emit(0x20, 0, 0, 24)                     # second argument: the signal
+            emit(0x15, 1, 0, 0)                      # signal 0 (existence check) is fine
+            emit(0x06, 0, 0, 0x00050001)
+            emit(0x06, 0, 0, 0x7FFF0000)
+        else:
+            labels[bad] = len(prog)
+            emit(0x06, 0, 0, 0x00050001)
+        labels[skip] = len(prog)
+    emit(0x06, 0, 0, 0x7FFF0000)
     out = []
-    for i, (code, jt, jf, k) in enumerate(ins):
-        if i == 1:
-            jf = allow_at - i - 1
-        elif code in (0x15, 0x35) and i >= 3:
-            jt = deny_at - i - 1
+    for i, (code, jt, jf, k) in enumerate(prog):
+        jt = labels[jt] - i - 1 if isinstance(jt, str) else jt
+        jf = labels[jf] - i - 1 if isinstance(jf, str) else jf
+        if not (0 <= jt < 256 and 0 <= jf < 256):
+            return False
         out.append(struct.pack("HBBI", code, jt, jf, k))
     blob = b"".join(out)
     buf = ctypes.create_string_buffer(blob, len(blob))
 
     class _Prog(ctypes.Structure):
         _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
-    prog = _Prog(len(ins), ctypes.addressof(buf))
+    prog = _Prog(len(out), ctypes.addressof(buf))
     if libc.prctl(22, 2, ctypes.byref(prog), 0, 0) != 0:
         return False
     return True
@@ -436,7 +477,7 @@ if libc.prctl(38, 1, 0, 0, 0) != 0:                # no new privileges
     _fail("could not set no-new-privileges")
 if rs_fd is not None and libc.syscall(446, rs_fd, 0) != 0:
     _fail("could not start the file lock")
-if cfg.get("seccomp") and not _seccomp(abi < 3):
+if cfg.get("seccomp") and not _seccomp(abi < 3, cfg.get("protect_pids") or ()):
     if cfg.get("seccomp_required"):
         _fail("could not set the system call filter")
 try:
@@ -649,6 +690,13 @@ def _sandbox_shared_dirs():
     return out
 
 
+def _protect_list():
+    """PIDs the system call filter of a hosted script refuses to signal (host first, then its parent chain)."""
+    pids = _protected_pids()
+    first = [pid for pid in (os.getpid(), os.getppid()) if pid in pids]
+    return (first + sorted(pids - set(first)))[:48]
+
+
 def _launcher_config(user_folder, dirs, uid, landlock, profile, work_dir=None):
     read_only = _sandbox_read_roots()
     limits = _sandbox_limits(profile)
@@ -658,7 +706,8 @@ def _launcher_config(user_folder, dirs, uid, landlock, profile, work_dir=None):
             'rw': [os.path.realpath(user_folder), os.path.realpath(dirs['base'])]
                   + ([os.path.realpath(work_dir)] if work_dir else [])
                   + ['/dev/null', '/dev/zero', '/dev/urandom', '/dev/random', '/dev/tty'] + _sandbox_shared_dirs(),
-            'limits': limits, 'uid': uid, 'seccomp': True, 'seccomp_required': False}
+            'limits': limits, 'uid': uid, 'seccomp': True, 'seccomp_required': False,
+            'protect_pids': _protect_list()}   # the host, its parent and group: a script may never signal them
 
 
 def _sandbox_build(command, user_folder, profile='run', state=None, work_dir=None):
@@ -677,6 +726,8 @@ def _sandbox_build(command, user_folder, profile='run', state=None, work_dir=Non
                 break
             parent = os.path.dirname(parent)
     cfg = _launcher_config(user_folder, dirs, uid, state['landlock'] and not state['bwrap'], profile, work_dir)
+    if state['bwrap']:
+        cfg['protect_pids'] = []                 # inside bubblewrap's own PID space the host cannot be seen at all
     wrapped = [sys.executable, '-I', '-c', _SANDBOX_LAUNCHER, json.dumps(cfg)] + list(command)
     if state['bwrap']:
         wrapped = _bwrap_prefix(state['bwrap'], user_folder, dirs, work_dir) + ['--'] + wrapped
@@ -3619,16 +3670,70 @@ def release_process_resources(process_info):
             _close_quietly(getattr(proc, stream_name, None))
 
 
-def _signal_process_group(pid, sig):
-    """Send a signal to the whole process group of a script (POSIX only).
-    Only done when the script leads its own group, so the hosting bot can never signal itself."""
-    if os.name != 'posix':
-        return
+def _protected_pids():
+    """PIDs that no stop / kill of a hosted script may ever touch: this hosting bot itself, its parent and every
+    ancestor (shell, supervisor, systemd), its own process group and session, and init."""
+    pids = {os.getpid(), 1}
+    if os.name == 'posix':
+        for getter in (os.getppid, os.getpgrp, lambda: os.getsid(0)):
+            try:
+                pids.add(int(getter()))
+            except (OSError, ValueError):
+                pass
     try:
-        if os.getpgid(pid) == pid:
+        ancestor = psutil.Process().parent()
+        while ancestor is not None and len(pids) < 64:
+            pids.add(ancestor.pid)
+            ancestor = ancestor.parent()
+    except Exception:
+        pass
+    pids.discard(0)
+    return pids
+
+
+def _is_protected_pid(pid):
+    """True for a PID that must never be signalled (not a usable number, the host, its parent chain, its group, init)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    return pid <= 1 or pid in _protected_pids()
+
+
+def _verify_script_pid(process_info):
+    """True only when process_info['process'].pid is still the very process the host started for that script.
+    Stale or recycled PIDs (for example after an import / restore, or a PID that was reused) fail this check, and so
+    does anything that is the host, its parent or its group: nothing is signalled then."""
+    process = process_info.get('process')
+    pid = getattr(process, 'pid', None)
+    if not isinstance(pid, int) or _is_protected_pid(pid):
+        return False
+    try:
+        live = psutil.Process(pid)
+        expected = process_info.get('pid_ctime')
+        if expected is not None:
+            return abs(live.create_time() - expected) < 1.5
+        # no start time recorded: it must be a Popen of this host that has not been reaped yet (so its PID cannot be reused)
+        return isinstance(process, subprocess.Popen) and process.poll() is None and live.ppid() == os.getpid()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return False
+
+
+def _signal_process_group(pid, sig):
+    """Send a signal to the whole process group of a script (POSIX only). Returns True when it was sent.
+    Only done when the script leads its own group, so the hosting bot can never signal itself, its own group or its parent."""
+    if os.name != 'posix':
+        return False
+    try:
+        if _is_protected_pid(pid):
+            return False
+        group = os.getpgid(pid)
+        if group == pid and group not in _protected_pids() and group != os.getpgrp():
             os.killpg(pid, sig)
+            return True
     except (ProcessLookupError, PermissionError, OSError):
         pass
+    return False
 
 
 def kill_process_tree(process_info):
@@ -3640,10 +3745,18 @@ def kill_process_tree(process_info):
         if not pid:
             logger.error(f"Process object/PID missing for {script_key}; cannot kill (files are still closed).")
             return
+        if not _verify_script_pid(process_info):
+            # Gone already, a stale / recycled PID, or the host itself / its parent: nothing is signalled, only the files are closed.
+            logger.warning(f"PID {pid} of {script_key} is not a live process started by this bot; not signalling it.")
+            try:
+                process.wait(timeout=0.2)
+            except Exception:
+                pass
+            return
         targets = []
         try:
             parent = psutil.Process(pid)
-            targets = parent.children(recursive=True) + [parent]
+            targets = [t for t in parent.children(recursive=True) + [parent] if not _is_protected_pid(t.pid)]
         except psutil.NoSuchProcess:
             logger.info(f"Process {pid} for {script_key} already gone.")
         logger.info(f"Stopping {script_key} (PID {pid}, {max(len(targets) - 1, 0)} child process(es))")
@@ -3658,9 +3771,11 @@ def kill_process_tree(process_info):
         _gone, alive = psutil.wait_procs(targets, timeout=3)
         if alive:
             logger.warning(f"{len(alive)} process(es) of {script_key} ignored SIGTERM; killing.")
-            if hasattr(signal, 'SIGKILL'):
+            if hasattr(signal, 'SIGKILL') and _verify_script_pid(process_info):
                 _signal_process_group(pid, signal.SIGKILL)
             for proc in alive:
+                if _is_protected_pid(proc.pid):
+                    continue
                 try:
                     proc.kill()
                 except psutil.NoSuchProcess:
@@ -6479,7 +6594,8 @@ def gh_clone(url, dest, branch=None, timeout=None, max_mb=None, local_test=False
         try:
             proc = subprocess.Popen(gh_clone_command(url, dest, branch, local_test), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=_gh_git_env(home),
-                                    cwd=home, text=True, errors='ignore')
+                                    cwd=home, text=True, errors='ignore',
+                                    start_new_session=(os.name == 'posix'))
         except FileNotFoundError:
             return 'nogit'
         except OSError:
@@ -7898,9 +8014,7 @@ def _kill_check_process(check_proc):
     try:
         if check_proc.poll() is None:
             if os.name == 'posix':
-                try:
-                    os.killpg(check_proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
+                if not _signal_process_group(check_proc.pid, signal.SIGKILL):   # never the host's own group
                     check_proc.kill()
             else:
                 check_proc.kill()
@@ -7911,6 +8025,11 @@ def _kill_check_process(check_proc):
 
 def _register_script(script_key, info):
     """Store a running script; if an older one with the same key is still alive, stop it first (no leaked processes)."""
+    try:
+        # the start time of the process: later it proves that this PID still is the same process (not a recycled / stale PID)
+        info.setdefault('pid_ctime', psutil.Process(info['process'].pid).create_time())
+    except Exception:
+        pass
     with STATE_LOCK:
         old = bot_scripts.get(script_key)
         bot_scripts[script_key] = info
@@ -13291,10 +13410,13 @@ def restart_all_scripts(admin_id, chat_id):
         launchers, held, failed = [], 0, 0
         was_running = 0
         for index, (owner_id, file_name, file_type, folder, info) in enumerate(targets):
-            pm.update(index, len(targets) + 1, UIRaw(f"Now: <code>{html_escape(file_name)}</code>"))
             key = _script_key(owner_id, file_name)
             path = os.path.join(folder, file_name)
             try:
+                try:
+                    pm.update(index, len(targets) + 1, UIRaw(f"Now: <code>{html_escape(file_name)}</code>"))
+                except Exception:
+                    logger.debug("Restart all: progress message could not be updated", exc_info=True)
                 allowed, _note = launch_gate(owner_id, file_name, file_type, admin_id, queue=False, admin_override=False)
                 if not allowed:       # checked BEFORE stopping, so a script that may not start again is not killed for nothing
                     held += 1
@@ -13317,10 +13439,16 @@ def restart_all_scripts(admin_id, chat_id):
             except Exception:
                 failed += 1
                 logger.exception("Restart all: could not restart %s", key)
-        pm.update(len(targets), len(targets) + 1, 'Waiting for the scripts to come back up...')
+        try:
+            pm.update(len(targets), len(targets) + 1, 'Waiting for the scripts to come back up...')
+        except Exception:
+            logger.debug("Restart all: progress message could not be updated", exc_info=True)
         deadline = time.time() + 90
         for _owner, _name, thread in launchers:
-            thread.join(timeout=max(0.1, deadline - time.time()))
+            try:
+                thread.join(timeout=max(0.1, deadline - time.time()))
+            except Exception:
+                logger.exception("Restart all: waiting for a start failed")
         up = sum(1 for owner_id, file_name, _t in launchers if is_bot_running(owner_id, file_name))
         lines = ["✅ Restart All finished.",
                  f"🔁 Restarted: {up} of {len(launchers)} script(s) are running again.",
@@ -13333,6 +13461,8 @@ def restart_all_scripts(admin_id, chat_id):
             lines.append(f"❌ Not running after restart: {len(launchers) - up} (the watchdog / Retry Failed Bots can try again)")
         _say_via(pm, chat_id, "\n".join(lines))
         logger.info("Restart all done by %s: targets=%s running=%s held=%s failed=%s", admin_id, len(targets), up, held, failed)
+    except Exception:
+        logger.exception("Restart all stopped by an unexpected error (the bot itself keeps running)")
     finally:
         if pm is not None and not pm._done:
             pm.fail()
@@ -13946,7 +14076,19 @@ def cleanup():
 atexit.register(cleanup)
 
 
+_SIGNAL_GUARD = {}
+
 def _handle_signal(signum, _frame):
+    # While an admin is restoring a backup or pressing "Restart All Bots", a stray SIGTERM / SIGINT (a hosted script that
+    # kills "its parent" or runs pkill, a closing terminal) must not end the whole hosting bot half way through.
+    # The first signal in such a moment is logged and ignored; a second one within 20 seconds (a real stop) is obeyed.
+    if RESTART_ALL_LOCK.locked() or BACKUP_OP_LOCK.locked():
+        now = time.time()
+        last = _SIGNAL_GUARD.get(signum)
+        _SIGNAL_GUARD[signum] = now
+        if last is None or now - last > 20:
+            logger.warning("Received signal %s during a restore / restart-all; ignored. Send it again within 20 seconds to really stop.", signum)
+            return
     logger.warning("Received signal %s; shutting down gracefully.", signum)
     SHUTDOWN_EVENT.set()
     try:
@@ -14024,6 +14166,11 @@ if __name__ == '__main__':
             signal.signal(_sig, _handle_signal)
         except (ValueError, OSError) as exc:
             logger.warning("Could not install handler for %s: %s", _sig, exc)
+    if hasattr(signal, 'SIGHUP'):
+        try:
+            signal.signal(signal.SIGHUP, lambda *_a: logger.warning("Received SIGHUP (terminal closed?); ignored, the bot keeps running."))
+        except (ValueError, OSError) as exc:
+            logger.warning("Could not ignore SIGHUP: %s", exc)
     if not acquire_instance_lock():
         logger.error("Another copy of this bot is already running (same data folder). Stopping this one.")
         logging.shutdown()
